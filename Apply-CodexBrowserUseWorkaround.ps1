@@ -3,6 +3,7 @@ param(
     [ValidateSet("Apply", "Undo", "Status")]
     [string]$Action = "Apply",
     [switch]$Force,
+    [switch]$ResetCuaRuntime,
     [string]$CodexHome
 )
 
@@ -184,6 +185,50 @@ function Undo-File($Entry, $State) {
     $false
 }
 
+function Get-CuaRuntimeProcesses {
+    $processes = @(Get-CimInstance Win32_Process)
+    $appServerIds = @(
+        $processes |
+            Where-Object {
+                $_.Name -eq "codex.exe" -and
+                $_.CommandLine -match "(?i)\bapp-server\b"
+            } |
+            Select-Object -ExpandProperty ProcessId
+    )
+    if ($appServerIds.Count -eq 0) { return @() }
+    @(
+        $processes |
+            Where-Object {
+                $_.Name -eq "node.exe" -and
+                $_.ParentProcessId -in $appServerIds -and
+                $_.CommandLine -match "(?i)@oai[\\/]+cua-repl[\\/]+bin[\\/]+cua-repl\.mjs"
+            }
+    )
+}
+
+function Reset-CuaRuntime {
+    $hosts = @(Get-CuaRuntimeProcesses)
+    if ($hosts.Count -eq 0) {
+        Write-Warning "No Codex CUA runtime process was found."
+        return
+    }
+
+    Write-Warning "Resetting $($hosts.Count) CUA runtime process(es); active computer-use sessions will be interrupted."
+    foreach ($cuaHost in $hosts) {
+        $children = @(Get-CimInstance Win32_Process |
+            Where-Object { $_.ParentProcessId -eq $cuaHost.ProcessId -and $_.Name -eq "node_repl.exe" })
+        foreach ($child in $children) {
+            if ($PSCmdlet.ShouldProcess("node_repl PID $($child.ProcessId)", "Stop CUA REPL child")) {
+                Stop-Process -Id $child.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+        }
+        if ($PSCmdlet.ShouldProcess("cua-repl PID $($cuaHost.ProcessId)", "Stop CUA runtime")) {
+            Stop-Process -Id $cuaHost.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Write-Output "CUA runtime reset requested; retry the browser/computer-use call."
+}
+
 $state = Read-State
 $changed = $false
 
@@ -225,7 +270,9 @@ switch ($Action) {
     }
 }
 
-if ($changed -and $Action -ne "Status") {
+if ($ResetCuaRuntime) {
+    Reset-CuaRuntime
+} elseif ($changed -and $Action -ne "Status") {
     $running = Get-Process -Name "Codex","ChatGPT" -ErrorAction SilentlyContinue
     if ($running) {
         Write-Warning "Restart Codex before retrying browser use; the running helper keeps the old service loaded."
